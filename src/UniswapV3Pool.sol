@@ -11,6 +11,7 @@ import "./lib/LiquidityMath.sol";
 import "./interfaces/IERC20.sol";
 import "./interfaces/IUniswapV3MintCallback.sol";
 import "./interfaces/IUniswapV3SwapCallback.sol";
+import "./interfaces/IUniswapV3PoolDeployer.sol";
 
 interface IUniswapV3FlashCallback {
     function uniswapV3FlashCallback(bytes calldata data) external;
@@ -26,6 +27,7 @@ contract UniswapV3Pool {
     error InvalidTickRange();
     error InvalidPriceLimit();
     error NotEnoughLiquidity();
+    error AlreadyInitialized();
     error InsufficientInputAmount();
 
     int24 internal constant MIN_TICK = -887272;
@@ -96,10 +98,15 @@ contract UniswapV3Pool {
         int24 tick
     );
     event Flash(address sender, uint256 amount0, uint256 amount1);
+    
+    constructor() {
+        (, token0, token1,) = IUniswapV3PoolDeployer(msg.sender).parameters();
+    }
 
-    constructor(address token0_, address token1_, uint160 sqrtPriceX96, int24 tick) {
-        token0 = token0_;
-        token1 = token1_;
+    function initialize(uint160 sqrtPriceX96) public {
+        if (slot0.sqrtPriceX96 != 0) revert AlreadyInitialized();
+
+        int24 tick = TickMath.getTickAtSqrtRatio(sqrtPriceX96);
 
         slot0 = Slot0({sqrtPriceX96: sqrtPriceX96, tick: tick});
     }
