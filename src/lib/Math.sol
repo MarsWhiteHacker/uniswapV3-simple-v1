@@ -36,6 +36,28 @@ library Math {
         amount1 = mulDivRoundingUp(liquidity, (sqrtPriceBX96 - sqrtPriceAX96), FixedPoint96.Q96);
     }
 
+    /// @notice Calculates amount0 delta between two prices
+    function calcAmount0Delta(uint160 sqrtPriceAX96, uint160 sqrtPriceBX96, int128 liquidity)
+        internal
+        pure
+        returns (int256 amount0)
+    {
+        amount0 = liquidity < 0
+            ? -int256(calcAmount0Delta(sqrtPriceAX96, sqrtPriceBX96, uint128(-liquidity)))
+            : int256(calcAmount0Delta(sqrtPriceAX96, sqrtPriceBX96, uint128(liquidity)));
+    }
+
+    /// @notice Calculates amount1 delta between two prices
+    function calcAmount1Delta(uint160 sqrtPriceAX96, uint160 sqrtPriceBX96, int128 liquidity)
+        internal
+        pure
+        returns (int256 amount1)
+    {
+        amount1 = liquidity < 0
+            ? -int256(calcAmount1Delta(sqrtPriceAX96, sqrtPriceBX96, uint128(-liquidity)))
+            : int256(calcAmount1Delta(sqrtPriceAX96, sqrtPriceBX96, uint128(liquidity)));
+    }
+
     function getNextSqrtPriceFromInput(uint160 sqrtPriceX96, uint128 liquidity, uint256 amountIn, bool zeroForOne)
         internal
         pure

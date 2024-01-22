@@ -9,6 +9,7 @@ import "./lib/SwapMath.sol";
 import "./lib/TickBitmap.sol";
 import "./lib/LiquidityMath.sol";
 import "./interfaces/IERC20.sol";
+import "./lib/FixedPoint128.sol";
 import "./interfaces/IUniswapV3MintCallback.sol";
 import "./interfaces/IUniswapV3SwapCallback.sol";
 import "./interfaces/IUniswapV3PoolDeployer.sol";
@@ -36,6 +37,11 @@ contract UniswapV3Pool {
     // Pool tokens, immutable
     address public immutable token0;
     address public immutable token1;
+    uint24 public immutable fee;
+    uint24 public immutable tickSpacing;
+
+    uint256 public feeGrowthGlobal0X128;
+    uint256 public feeGrowthGlobal1X128;
 
     struct CallbackData {
         address token0;
@@ -57,6 +63,7 @@ contract UniswapV3Pool {
         uint160 sqrtPriceX96;
         int24 tick;
         uint128 liquidity;
+        uint256 feeGrowthGlobalX128;
     }
 
     struct StepState {
@@ -66,6 +73,7 @@ contract UniswapV3Pool {
         uint256 amountIn;
         uint256 amountOut;
         bool initialized;
+        uint256 feeAmount;
     }
 
     Slot0 public slot0;
@@ -88,6 +96,10 @@ contract UniswapV3Pool {
         uint256 amount0,
         uint256 amount1
     );
+    event Burn(address sender, int24 lowerTick, int24 upperTick, uint256 amount, uint256 amount0, uint256 amount1);
+    event Collect(
+        address sender, address recipient, int24 lowerTick, int24 upperTick, uint256 amount0, uint256 amount1
+    );
     event Swap(
         address sender,
         address recipient,
@@ -98,9 +110,9 @@ contract UniswapV3Pool {
         int24 tick
     );
     event Flash(address sender, uint256 amount0, uint256 amount1);
-    
+
     constructor() {
-        (, token0, token1,) = IUniswapV3PoolDeployer(msg.sender).parameters();
+        (, token0, token1, tickSpacing, fee) = IUniswapV3PoolDeployer(msg.sender).parameters();
     }
 
     function initialize(uint160 sqrtPriceX96) public {
@@ -109,6 +121,80 @@ contract UniswapV3Pool {
         int24 tick = TickMath.getTickAtSqrtRatio(sqrtPriceX96);
 
         slot0 = Slot0({sqrtPriceX96: sqrtPriceX96, tick: tick});
+    }
+
+    struct ModifyPositionParams {
+        address owner;
+        int24 lowerTick;
+        int24 upperTick;
+        int128 liquidityDelta;
+    }
+
+    function _modifyPosition(ModifyPositionParams memory params)
+        internal
+        returns (Position.Info storage position, int256 amount0, int256 amount1)
+    {
+        // gas optimizations
+        Slot0 memory slot0_ = slot0;
+        uint256 feeGrowthGlobal0X128_ = feeGrowthGlobal0X128;
+        uint256 feeGrowthGlobal1X128_ = feeGrowthGlobal1X128;
+
+        position = positions.get(params.owner, params.lowerTick, params.upperTick);
+
+        bool flippedLower = ticks.update(
+            params.lowerTick,
+            slot0_.tick,
+            int128(params.liquidityDelta),
+            feeGrowthGlobal0X128_,
+            feeGrowthGlobal1X128_,
+            false
+        );
+        bool flippedUpper = ticks.update(
+            params.upperTick,
+            slot0_.tick,
+            int128(params.liquidityDelta),
+            feeGrowthGlobal0X128_,
+            feeGrowthGlobal1X128_,
+            true
+        );
+
+        if (flippedLower) {
+            tickBitmap.flipTick(params.lowerTick, int24(tickSpacing));
+        }
+
+        if (flippedUpper) {
+            tickBitmap.flipTick(params.upperTick, int24(tickSpacing));
+        }
+
+        (uint256 feeGrowthInside0X128, uint256 feeGrowthInside1X128) = ticks.getFeeGrowthInside(
+            params.lowerTick, params.upperTick, slot0_.tick, feeGrowthGlobal0X128_, feeGrowthGlobal1X128_
+        );
+
+        position.update(params.liquidityDelta, feeGrowthInside0X128, feeGrowthInside1X128);
+
+        if (slot0_.tick < params.lowerTick) {
+            amount0 = Math.calcAmount0Delta(
+                TickMath.getSqrtRatioAtTick(params.lowerTick),
+                TickMath.getSqrtRatioAtTick(params.upperTick),
+                params.liquidityDelta
+            );
+        } else if (slot0_.tick < params.upperTick) {
+            amount0 = Math.calcAmount0Delta(
+                slot0_.sqrtPriceX96, TickMath.getSqrtRatioAtTick(params.upperTick), params.liquidityDelta
+            );
+
+            amount1 = Math.calcAmount1Delta(
+                TickMath.getSqrtRatioAtTick(params.lowerTick), slot0_.sqrtPriceX96, params.liquidityDelta
+            );
+
+            liquidity = LiquidityMath.addLiquidity(liquidity, params.liquidityDelta);
+        } else {
+            amount1 = Math.calcAmount1Delta(
+                TickMath.getSqrtRatioAtTick(params.lowerTick),
+                TickMath.getSqrtRatioAtTick(params.upperTick),
+                params.liquidityDelta
+            );
+        }
     }
 
     /**
@@ -121,37 +207,17 @@ contract UniswapV3Pool {
         if (lowerTick >= upperTick || lowerTick < MIN_TICK || upperTick > MAX_TICK) revert InvalidTickRange();
         if (amount == 0) revert ZeroLiquidity();
 
-        bool flippedLower = ticks.update(lowerTick, amount, false);
-        bool flippedUpper = ticks.update(upperTick, amount, true);
+        (, int256 amount0Int, int256 amount1Int) = _modifyPosition(
+            ModifyPositionParams({
+                owner: owner,
+                lowerTick: lowerTick,
+                upperTick: upperTick,
+                liquidityDelta: int128(amount)
+            })
+        );
 
-        if (flippedLower) {
-            tickBitmap.flipTick(lowerTick, 1);
-        }
-
-        if (flippedUpper) {
-            tickBitmap.flipTick(upperTick, 1);
-        }
-
-        Position.Info storage position = positions.get(owner, lowerTick, upperTick);
-        position.update(amount);
-
-        Slot0 memory slot0_ = slot0;
-
-        if (slot0_.tick < lowerTick) {
-            amount0 = Math.calcAmount0Delta(
-                TickMath.getSqrtRatioAtTick(lowerTick), TickMath.getSqrtRatioAtTick(upperTick), amount
-            );
-        } else if (slot0_.tick < upperTick) {
-            amount0 = Math.calcAmount0Delta(slot0_.sqrtPriceX96, TickMath.getSqrtRatioAtTick(upperTick), amount);
-
-            amount1 = Math.calcAmount1Delta(slot0_.sqrtPriceX96, TickMath.getSqrtRatioAtTick(lowerTick), amount);
-
-            liquidity = LiquidityMath.addLiquidity(liquidity, int128(amount));
-        } else {
-            amount1 = Math.calcAmount1Delta(
-                TickMath.getSqrtRatioAtTick(lowerTick), TickMath.getSqrtRatioAtTick(upperTick), amount
-            );
-        }
+        amount0 = uint256(amount0Int);
+        amount1 = uint256(amount1Int);
 
         uint256 balance0Before;
         uint256 balance1Before;
@@ -166,6 +232,52 @@ contract UniswapV3Pool {
         }
 
         emit Mint(msg.sender, owner, lowerTick, upperTick, amount, amount0, amount1);
+    }
+
+    function burn(int24 lowerTick, int24 upperTick, uint128 amount) public returns (uint256 amount0, uint256 amount1) {
+        (Position.Info storage position, int256 amount0Int, int256 amount1Int) = _modifyPosition(
+            ModifyPositionParams({
+                owner: msg.sender,
+                lowerTick: lowerTick,
+                upperTick: upperTick,
+                liquidityDelta: -(int128(amount))
+            })
+        );
+
+        amount0 = uint256(-amount0Int);
+        amount1 = uint256(-amount1Int);
+
+        if (amount0 > 0 || amount1 > 0) {
+            (position.tokensOwed0, position.tokensOwed1) =
+                (position.tokensOwed0 + uint128(amount0), position.tokensOwed1 + uint128(amount1));
+        }
+
+        emit Burn(msg.sender, lowerTick, upperTick, amount, amount0, amount1);
+    }
+
+    function collect(
+        address recipient,
+        int24 lowerTick,
+        int24 upperTick,
+        uint128 amount0Requested,
+        uint128 amount1Requested
+    ) public returns (uint128 amount0, uint128 amount1) {
+        Position.Info storage position = positions.get(msg.sender, lowerTick, upperTick);
+
+        amount0 = amount0Requested > position.tokensOwed0 ? position.tokensOwed0 : amount0Requested;
+        amount1 = amount1Requested > position.tokensOwed1 ? position.tokensOwed1 : amount1Requested;
+
+        if (amount0 > 0) {
+            position.tokensOwed0 -= amount0;
+            IERC20(token0).transfer(recipient, amount0);
+        }
+
+        if (amount1 > 0) {
+            position.tokensOwed1 -= amount1;
+            IERC20(token1).transfer(recipient, amount1);
+        }
+
+        emit Collect(msg.sender, recipient, lowerTick, upperTick, amount0, amount1);
     }
 
     function balance0() internal view returns (uint256 balance) {
@@ -196,7 +308,8 @@ contract UniswapV3Pool {
             amountCalculated: 0,
             sqrtPriceX96: slot0_.sqrtPriceX96,
             tick: slot0_.tick,
-            liquidity: liquidity
+            liquidity: liquidity,
+            feeGrowthGlobalX128: zeroForOne ? feeGrowthGlobal0X128 : feeGrowthGlobal1X128
         });
 
         while (state.amountSpecifiedRemaining > 0 && state.sqrtPriceX96 != sqrtPriceLimitX96) {
@@ -208,21 +321,30 @@ contract UniswapV3Pool {
 
             step.sqrtPriceNextX96 = TickMath.getSqrtRatioAtTick(step.nextTick);
 
-            (state.sqrtPriceX96, step.amountIn, step.amountOut) = SwapMath.computeSwapStep(
+            (state.sqrtPriceX96, step.amountIn, step.amountOut, step.feeAmount) = SwapMath.computeSwapStep(
                 state.sqrtPriceX96,
                 (zeroForOne ? step.sqrtPriceNextX96 < sqrtPriceLimitX96 : step.sqrtPriceNextX96 > sqrtPriceLimitX96)
                     ? sqrtPriceLimitX96
                     : step.sqrtPriceNextX96,
                 state.liquidity,
-                state.amountSpecifiedRemaining
+                state.amountSpecifiedRemaining,
+                fee
             );
+
+            if (state.liquidity > 0) {
+                state.feeGrowthGlobalX128 += PRBMath.mulDiv(step.feeAmount, FixedPoint128.Q128, state.liquidity);
+            }
 
             state.amountSpecifiedRemaining -= step.amountIn;
             state.amountCalculated += step.amountOut;
 
             if (state.sqrtPriceX96 == step.sqrtPriceNextX96) {
                 if (step.initialized) {
-                    int128 liquidityDelta = ticks.cross(step.nextTick);
+                    int128 liquidityDelta = ticks.cross(
+                        step.nextTick,
+                        (zeroForOne ? state.feeGrowthGlobalX128 : feeGrowthGlobal0X128),
+                        (zeroForOne ? feeGrowthGlobal1X128 : state.feeGrowthGlobalX128)
+                    );
 
                     if (zeroForOne) liquidityDelta = -liquidityDelta;
 
@@ -235,6 +357,12 @@ contract UniswapV3Pool {
             } else {
                 state.tick = TickMath.getTickAtSqrtRatio(state.sqrtPriceX96);
             }
+        }
+
+        if (zeroForOne) {
+            feeGrowthGlobal0X128 = state.feeGrowthGlobalX128;
+        } else {
+            feeGrowthGlobal1X128 = state.feeGrowthGlobalX128;
         }
 
         if (liquidity != state.liquidity) liquidity = state.liquidity;
