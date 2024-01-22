@@ -43,8 +43,8 @@ library Tick {
         flipped = (liquidityAfter == 0) != (liquidityBefore == 0);
 
         tickInfo.liquidityNet = upper
-            ? int128(int256(tickInfo.liquidityNet) - int256(uint256(liquidityDelta)))
-            : int128(int256(tickInfo.liquidityNet) + int256(uint256(liquidityDelta)));
+            ? int128(int256(tickInfo.liquidityNet) - liquidityDelta)
+            : int128(int256(tickInfo.liquidityNet) + liquidityDelta);
     }
 
     function cross(
