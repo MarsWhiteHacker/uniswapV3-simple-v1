@@ -3,6 +3,7 @@ pragma solidity ^0.8.14;
 
 import "./lib/Tick.sol";
 import "./lib/Math.sol";
+import "./lib/Oracle.sol";
 import "./lib/TickMath.sol";
 import "./lib/Position.sol";
 import "./lib/SwapMath.sol";
@@ -15,7 +16,7 @@ import "./interfaces/IUniswapV3SwapCallback.sol";
 import "./interfaces/IUniswapV3PoolDeployer.sol";
 
 interface IUniswapV3FlashCallback {
-    function uniswapV3FlashCallback(bytes calldata data) external;
+    function uniswapV3FlashCallback(uint256 fee0, uint256 fee1, bytes calldata data) external;
 }
 
 contract UniswapV3Pool {
@@ -23,8 +24,10 @@ contract UniswapV3Pool {
     using Position for mapping(bytes32 => Position.Info);
     using Position for Position.Info;
     using TickBitmap for mapping(int16 => uint256);
+    using Oracle for Oracle.Observation[65535];
 
     error ZeroLiquidity();
+    error FlashLoanNotPaid();
     error InvalidTickRange();
     error InvalidPriceLimit();
     error NotEnoughLiquidity();
@@ -43,6 +46,8 @@ contract UniswapV3Pool {
     uint256 public feeGrowthGlobal0X128;
     uint256 public feeGrowthGlobal1X128;
 
+    Oracle.Observation[65535] public observations;
+
     struct CallbackData {
         address token0;
         address token1;
@@ -55,6 +60,12 @@ contract UniswapV3Pool {
         uint160 sqrtPriceX96;
         // Current tick
         int24 tick;
+        // Most recent observation index
+        uint16 observationIndex;
+        // Maximum number of observations
+        uint16 observationCardinality;
+        // Next maximum number of observations
+        uint16 observationCardinalityNext;
     }
 
     struct SwapState {
@@ -110,6 +121,9 @@ contract UniswapV3Pool {
         int24 tick
     );
     event Flash(address sender, uint256 amount0, uint256 amount1);
+    event IncreaseObservationCardinalityNext(
+        uint16 observationCardinalityNextOld, uint16 observationCardinalityNextNew
+    );
 
     constructor() {
         (, token0, token1, tickSpacing, fee) = IUniswapV3PoolDeployer(msg.sender).parameters();
@@ -120,7 +134,15 @@ contract UniswapV3Pool {
 
         int24 tick = TickMath.getTickAtSqrtRatio(sqrtPriceX96);
 
-        slot0 = Slot0({sqrtPriceX96: sqrtPriceX96, tick: tick});
+        (uint16 cardinality, uint16 cardinalityNext) = observations.initialize(_blockTimestamp());
+
+        slot0 = Slot0({
+            sqrtPriceX96: sqrtPriceX96,
+            tick: tick,
+            observationIndex: 0,
+            observationCardinality: cardinality,
+            observationCardinalityNext: cardinalityNext
+        });
     }
 
     struct ModifyPositionParams {
@@ -280,14 +302,6 @@ contract UniswapV3Pool {
         emit Collect(msg.sender, recipient, lowerTick, upperTick, amount0, amount1);
     }
 
-    function balance0() internal view returns (uint256 balance) {
-        balance = IERC20(token0).balanceOf(address(this));
-    }
-
-    function balance1() internal view returns (uint256 balance) {
-        balance = IERC20(token1).balanceOf(address(this));
-    }
-
     function swap(
         address recipient,
         bool zeroForOne,
@@ -368,7 +382,16 @@ contract UniswapV3Pool {
         if (liquidity != state.liquidity) liquidity = state.liquidity;
 
         if (state.tick != slot0_.tick) {
-            (slot0.sqrtPriceX96, slot0.tick) = (state.sqrtPriceX96, state.tick);
+            (uint16 observationIndex, uint16 observationCardinality) = observations.write(
+                slot0_.observationIndex,
+                _blockTimestamp(),
+                slot0_.tick,
+                slot0_.observationCardinality,
+                slot0_.observationCardinalityNext
+            );
+
+            (slot0.sqrtPriceX96, slot0.tick, slot0.observationIndex, slot0.observationCardinality) =
+                (state.sqrtPriceX96, state.tick, observationIndex, observationCardinality);
         }
 
         (amount0, amount1) = zeroForOne
@@ -397,17 +420,53 @@ contract UniswapV3Pool {
     }
 
     function flash(uint256 amount0, uint256 amount1, bytes calldata data) public {
+        uint256 fee0 = Math.mulDivRoundingUp(amount0, fee, 1e6);
+        uint256 fee1 = Math.mulDivRoundingUp(amount1, fee, 1e6);
+
         uint256 balance0Before = IERC20(token0).balanceOf(address(this));
         uint256 balance1Before = IERC20(token1).balanceOf(address(this));
 
         if (amount0 > 0) IERC20(token0).transfer(msg.sender, amount0);
         if (amount1 > 0) IERC20(token1).transfer(msg.sender, amount1);
 
-        IUniswapV3FlashCallback(msg.sender).uniswapV3FlashCallback(data);
+        IUniswapV3FlashCallback(msg.sender).uniswapV3FlashCallback(fee0, fee1, data);
 
-        require(IERC20(token0).balanceOf(address(this)) >= balance0Before);
-        require(IERC20(token1).balanceOf(address(this)) >= balance1Before);
+        if (IERC20(token0).balanceOf(address(this)) < balance0Before + fee0) {
+            revert FlashLoanNotPaid();
+        }
+        if (IERC20(token1).balanceOf(address(this)) < balance1Before + fee1) {
+            revert FlashLoanNotPaid();
+        }
 
         emit Flash(msg.sender, amount0, amount1);
+    }
+
+    function increaseObservationCardinalityNext(uint16 observationCardinalityNext) public {
+        uint16 observationCardinalityNextOld = slot0.observationCardinalityNext;
+        uint16 observationCardinalityNextNew =
+            observations.grow(observationCardinalityNextOld, observationCardinalityNext);
+
+        if (observationCardinalityNextNew != observationCardinalityNextOld) {
+            slot0.observationCardinalityNext = observationCardinalityNextNew;
+            emit IncreaseObservationCardinalityNext(observationCardinalityNextOld, observationCardinalityNextNew);
+        }
+    }
+
+    function observe(uint32[] calldata secondsAgos) public view returns (int56[] memory tickCumulatives) {
+        return observations.observe(
+            _blockTimestamp(), secondsAgos, slot0.tick, slot0.observationIndex, slot0.observationCardinality
+        );
+    }
+
+    function _blockTimestamp() internal view returns (uint32 timestamp) {
+        timestamp = uint32(block.timestamp);
+    }
+
+    function balance0() internal view returns (uint256 balance) {
+        balance = IERC20(token0).balanceOf(address(this));
+    }
+
+    function balance1() internal view returns (uint256 balance) {
+        balance = IERC20(token1).balanceOf(address(this));
     }
 }
