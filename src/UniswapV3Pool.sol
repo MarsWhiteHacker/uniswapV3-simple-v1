@@ -335,7 +335,7 @@ contract UniswapV3Pool {
                 state.feeGrowthGlobalX128 += PRBMath.mulDiv(step.feeAmount, FixedPoint128.Q128, state.liquidity);
             }
 
-            state.amountSpecifiedRemaining -= step.amountIn;
+            state.amountSpecifiedRemaining -= step.amountIn + step.feeAmount;
             state.amountCalculated += step.amountOut;
 
             if (state.sqrtPriceX96 == step.sqrtPriceNextX96) {
